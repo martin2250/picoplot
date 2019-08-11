@@ -1,0 +1,316 @@
+#!/usr/bin/env python
+# PYTHON_ARGCOMPLETE_OK
+import argparse
+
+import argcomplete
+
+################################################################################
+
+parser = argparse.ArgumentParser(
+	description='uses picoscope to get frequency response of circuit')
+
+parser.add_argument('output',
+                    help='output file, tab separated')
+
+parser.add_argument('freq_start', metavar='freq-start', type=float,
+                    help='sweep start frequency')
+parser.add_argument('freq_stop', metavar='freq-stop', type=float,
+                    help='sweep stop frequency')
+
+list_channels = ['A', 'B', 'C', 'D']
+parser.add_argument('channel_input', metavar='channel-input', choices=list_channels,
+                    help='name of input channel')
+parser.add_argument('channel_output', metavar='channel-output', choices=list_channels,
+                    help='name of output channel')
+
+parser.add_argument('--append', action='store_true',
+                    help='append to file instead of overwriting')
+parser.add_argument('--sweep', choices=['log', 'linear'],
+                    default='log',
+                    help='sweep type')
+parser.add_argument('--reverse', action='store_true',
+                    help='start at high frequency')
+parser.add_argument('--voltage', type=float, default=0.1,
+                    help='generator output voltage')
+parser.add_argument('--voltage-boost', type=float, nargs=2, metavar=['boost-low', 'boost-high'],
+                    help='boot voltage at low and high frequencies with first order bandpass response, arguments are low and high cutoff frequency')
+parser.add_argument('--voltage-boost-max', type=float, default=1,
+                    help='maximum boosted voltage')
+
+parser.add_argument('--points', type=int, default=100,
+                    help='number of points')
+parser.add_argument('--samples', type=int, default=10000,
+                    help='number of samples per waveform')
+parser.add_argument('--max-sample-rate', type=int, default=500000000,
+                    help='maximum sample rate of oscilloscope')
+parser.add_argument('--periods', type=float, default=5,
+                    help='minimum number of sine periods to use for each frequency')
+parser.add_argument('--invert', action='store_true',
+                    help='invert output signal')
+
+parser.add_argument('--range-min', type=float, default=0,
+                    help='minimum voltage range to use for inputs')
+parser.add_argument('--range-max', type=float, default=float('inf'),
+                    help='maximum voltage range to use for inputs')
+
+parser.add_argument('--retries', type=int, default=6,
+                    help='maximum number of retries for frequency')
+
+
+parser.add_argument('--show-fits', action='store_true',
+                    help='show fit for every point')
+parser.add_argument('--plot', action='store_true',
+                    help='show final plot by calling plot-bode')
+
+parser.add_argument('-v', '--verbose', action='store_true',
+                    help='print more debug stuff')
+parser.add_argument('-y', '--yes', action='store_true',
+                    help='overwrite output file')
+
+parser.add_argument('--pico-series', choices=['3000a', '6000'],
+                    default='6000',
+                    help='picoscope series')
+
+argcomplete.autocomplete(parser)
+args = parser.parse_args()
+
+################################################################################
+
+# prevent autopep8 from moving these imports to the front
+if True:
+	import os
+	import sys
+	import time
+	from dataclasses import dataclass
+
+	import numpy as np
+	import picoscope
+	import scipy.optimize
+	import lib.fitgain
+
+################################################################################
+
+if not args.yes and not args.append and os.path.exists(args.output):
+	response = input('output file exists, overwrite? (y/N)')
+	if response != 'y':
+		exit(0)
+
+################################################################################
+
+if args.show_fits:
+	import matplotlib.pyplot as plt
+	axis = plt.gca()
+	plt.ion()
+	plt.show()
+
+################################################################################
+
+if args.pico_series == '6000':
+	import picoscope.ps6000
+	scope = picoscope.ps6000.PS6000()
+elif args.pico_series == '3000a':
+	import picoscope.ps3000a
+	scope = picoscope.ps3000a.PS3000a()
+
+################################################################################
+
+
+def get_output_voltage(frequency):
+	voltage = args.voltage
+	if args.voltage_boost:
+		voltage /= lib.fitgain.bandpass(frequency, 1, *args.voltage_boost)
+	voltage = min(voltage, args.voltage_boost_max)
+	return voltage
+
+################################################################################
+
+
+voltage_ranges = [50e-3, 100e-3, 200e-3, 500e-3, 1.0, 2.0, 5.0, 10.0, 20.0]
+voltage_ranges = np.array([range for range in voltage_ranges if (
+	range < args.range_max and range > args.range_min)])
+
+name_channels = {'input': args.channel_input, 'output': args.channel_output}
+
+initial_range = np.argmax(
+	get_output_voltage(args.freq_start) * 1.1 <= voltage_ranges)
+index_current_ranges = {'input': initial_range, 'output': initial_range}
+
+
+def update_range(name_channel):
+	scope.setChannel(name_channels[name_channel], coupling='DC',
+                  VRange=voltage_ranges[index_current_ranges[name_channel]])
+
+
+update_range('input')
+update_range('output')
+scope.setSimpleTrigger(name_channels['input'], threshold_V=0)
+scope.setNoOfCaptures(1)
+
+################################################################################
+
+
+def checkRange(name_channel, voltage, overflow):
+	retry = False
+
+	if np.any(overflow):
+		retry = True
+		print(f'{name_channel} overrange')
+		if (index_current_ranges[name_channel] + 1) < len(voltage_ranges):
+			print(
+                            f'increasing scale from {voltage_ranges[index_current_ranges[name_channel]]} to {voltage_ranges[index_current_ranges[name_channel] + 1]}')
+			index_current_ranges[name_channel] += 1
+			update_range(name_channel)
+
+	if index_current_ranges[name_channel] > 0:
+		voltage_max = np.max(np.abs(voltage))
+		minindex = np.argmax(voltage_max < (0.7 * voltage_ranges))
+
+		if minindex < index_current_ranges[name_channel]:
+			print(f'{name_channel} underrange')
+			print(
+                            f'decreasing scale from {voltage_ranges[index_current_ranges[name_channel]]} to {voltage_ranges[minindex]}')
+			index_current_ranges[name_channel] = minindex
+			retry = True
+			update_range(name_channel)
+
+	return retry
+
+################################################################################
+
+
+@dataclass
+class FitResult:
+	frequency: float
+	amplitude: float
+	phase: float
+	offset: float
+	time: np.array
+	voltage: np.array
+
+
+def sine(t, amplitude, frequency, phase, offset):
+	return amplitude * np.sin(2 * np.pi * frequency * t - phase) + offset
+
+
+def fitsine(T, U, freq_approx):
+	offset_mean = np.mean(U)
+	amplitude_max = np.max(np.abs(U - offset_mean)) or 0.01
+
+	def sine_phase(t, phase):
+		return amplitude_max * np.sin(2 * np.pi * freq_approx * t - phase) + offset_mean
+
+	(phase_approx), _ = scipy.optimize.curve_fit(
+                sine_phase, T, U, [0], bounds=([- np.pi], [np.pi]))
+
+	# do proper fit
+	guess = [amplitude_max, freq_approx, phase_approx, offset_mean]
+	bounds = (
+                [amplitude_max * 0.7, freq_approx * 0.5, -np.pi, -amplitude_max],
+                [amplitude_max, freq_approx / 0.5, np.pi, amplitude_max])
+	result, _ = scipy.optimize.curve_fit(sine, T, U, guess, bounds=bounds)
+
+	amplitude, frequency, phase, offset = result
+
+	return FitResult(amplitude=amplitude, frequency=frequency, phase=phase, offset=offset, time=T, voltage=U)
+
+################################################################################
+
+
+with open(args.output, 'wa' if args.append else 'w') as file_output:
+	file_output.write('# ' + ' '.join(sys.argv)
+	                  + '\n# Frequency f (Hz)\n# Gain a\n# Phase p (rad)\n# f\ta\tp\n')
+
+	frequencies = np.logspace(np.log10(args.freq_start),
+	                          np.log10(args.freq_stop), args.points)
+
+	if args.reverse:
+		frequencies = np.flip(frequencies)
+
+	for (index, frequency) in enumerate(frequencies):
+		voltage_generator = get_output_voltage(frequency)
+
+		scope.setSigGenBuiltInSimple(
+                        pkToPk=voltage_generator * 2, frequency=frequency, shots=0xFFFFFF)
+
+		frequency_sample_set = min(
+			frequency * args.samples / args.periods, args.max_sample_rate)
+		frequency_sample, _ = scope.setSamplingFrequency(
+			frequency_sample_set, args.samples)
+
+		print(f'{index}/{len(frequencies)}\tf: {frequency:0.2f} Hz\tfs: {frequency_sample:0.0f} ({frequency_sample_set:0.0f})\tV_out: {voltage_generator:0.1f}V')
+		time.sleep(max(0.5 / frequency, 0.05))
+
+		try:
+			for i in range(args.retries):
+				try:
+					scope.runBlock()
+					scope.waitReady()
+
+					voltage_input, overflow_input = scope.getDataV(
+	                                    name_channels['input'], returnOverflow=True)
+					voltage_output, overflow_output = scope.getDataV(
+	                                    name_channels['output'], returnOverflow=True)
+
+					retry_input = checkRange('input', voltage_input, overflow_input)
+					retry_output = checkRange('output', voltage_output, overflow_output)
+
+					if not retry_input and not retry_output:
+						break
+				except KeyboardInterrupt:
+					input('paused, press enter to continue')
+
+			if args.invert:
+				voltage_output = -voltage_output
+
+			T = np.arange(len(voltage_input)) / frequency_sample
+
+			result_in = fitsine(T, voltage_input, frequency)
+			result_out = fitsine(T, voltage_output, frequency)
+
+			if args.show_fits:
+				plt.clf()
+				plt.plot(T, voltage_input, 'x', color='C0')
+				plt.plot(T, voltage_output, 'x', color='C1')
+				if result_in:
+					plt.plot(T, sine(T, result_in.amplitude, result_in.frequency,
+                                            result_in.phase, result_in.offset))
+				if result_out:
+					plt.plot(T, sine(T, result_out.amplitude, result_out.frequency,
+                                            result_out.phase, result_out.offset))
+
+				range_input = voltage_ranges[index_current_ranges['input']]
+				range_output = voltage_ranges[index_current_ranges['output']]
+
+				plt.hlines([range_input, -range_input, range_output,
+                                    - range_output], T[0], T[-1], ['C0', 'C0', 'C1', 'C1'])
+
+				plt.draw()
+				plt.pause(0.001)
+
+			if result_in and result_out:
+				gain = result_out.amplitude / result_in.amplitude
+				phase = result_out.phase - result_in.phase
+				freq = (result_in.frequency + result_out.frequency) / 2
+				freq_diff_rel = (result_in.frequency - result_out.frequency) / freq
+
+				if freq_diff_rel > 0.05:
+					print(
+						f'warning: frequencies of fits differ by {freq_diff_rel*100:0.1f}%, the following value will be commented out in the data file')
+					print(f'input: {result_in.frequency:0.2f}')
+					print(f'output: {result_out.frequency:0.2f}')
+					file_output.write(f'# f_in: {result_in.frequency:0.2f}\n')
+					file_output.write(f'# f_out: {result_out.frequency:0.2f}\n')
+					file_output.write('# ')
+
+				print(f'f: {freq:0.2f}\tg: {gain:0.2f}\tp: {phase*180/np.pi:0.0f}°')
+
+				file_output.write(
+                                    f'{freq:0.3f}\t{gain:0.3f}\t{phase:0.3f}\n')
+
+		except Exception as e:
+			print(e)
+
+if args.plot:
+	import subprocess
+	subprocess.Popen(['plot-bode', args.output], close_fds=True,
+	                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
